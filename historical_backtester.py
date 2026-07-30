@@ -1,9 +1,8 @@
 """Historical backtesting engine — all 3 strategies + post-trade comparison."""
 
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import timedelta
 from typing import Optional, List, Dict, Any
-from zoneinfo import ZoneInfo
 
 import yfinance as yf
 import pandas as pd
@@ -11,7 +10,7 @@ import numpy as np
 
 from config import CONFIG
 from database import Database
-from logging_utils import setup_logging, format_with_tz
+from logging_utils import setup_logging
 
 
 class HistoricalBacktester:
@@ -19,7 +18,6 @@ class HistoricalBacktester:
         self.config = CONFIG
         self.db = db
         self.logger = setup_logging("backtester", run_dir)
-        self.exchange_tz = ZoneInfo(self.config.exchange_timezone)
 
     def backtest_pead(self, start_date: str, end_date: str) -> List[Dict[str, Any]]:
         results = []
