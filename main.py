@@ -14,7 +14,7 @@ from database import Database
 from executor import Executor
 from screeners import scan_pead_candidates, scan_microcap_filings, scan_cef_discounts
 from historical_backtester import HistoricalBacktester
-from logging_utils import setup_logging, format_with_tz, session_startup_log
+from logging_utils import setup_logging, session_startup_log
 
 
 def _run_dir(mode: str) -> str:
@@ -39,25 +39,27 @@ def mode_backtest(args):
     strategies = args.strategies or ["pead", "microcap", "cef"]
     all_results = []
 
-    for strat in strategies:
-        logger.info("=== RUNNING %s ===", strat.upper())
-        if strat == "pead":
-            r = bt.backtest_pead(start, end)
-        elif strat == "microcap":
-            r = bt.backtest_microcaps(start, end)
-        else:
-            r = bt.backtest_cefs(start, end)
-        all_results.extend(r)
-        metrics = bt.generate_performance_metrics(strat)
-        if metrics:
-            _print_metrics(strat, metrics)
+    try:
+        for strat in strategies:
+            logger.info("=== RUNNING %s ===", strat.upper())
+            if strat == "pead":
+                r = bt.backtest_pead(start, end)
+            elif strat == "microcap":
+                r = bt.backtest_microcaps(start, end)
+            else:
+                r = bt.backtest_cefs(start, end)
+            all_results.extend(r)
+            metrics = bt.generate_performance_metrics(strat)
+            if metrics:
+                _print_metrics(strat, metrics)
 
-    if all_results:
-        total_pnl = sum(r.get("pnl_usd", 0) for r in all_results)
-        wins = sum(1 for r in all_results if r["pnl_pct"] > 0)
-        logger.info("Combined: %d trades | $%.2f PnL | %.1f%% wins",
-                    len(all_results), total_pnl, (wins / len(all_results) * 100))
-    db.close()
+        if all_results:
+            total_pnl = sum(r.get("pnl_usd", 0) for r in all_results)
+            wins = sum(1 for r in all_results if r["pnl_pct"] > 0)
+            logger.info("Combined: %d trades | $%.2f PnL | %.1f%% wins",
+                        len(all_results), total_pnl, (wins / len(all_results) * 100))
+    finally:
+        db.close()
 
 
 def mode_live(args):
@@ -103,7 +105,10 @@ def mode_live(args):
             time.sleep(1)
 
     logger.info("Shutdown complete")
-    db.close()
+    try:
+        db.close()
+    except Exception:
+        pass
 
 
 def _run_screener(name, scan_func, db, run_dir, executor, logger):
