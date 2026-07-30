@@ -159,7 +159,7 @@ def main():
     try:
         CONFIG.validate()
     except ValueError as e:
-        print(f"Config error: {e}")
+        import sys; sys.stderr.write(f"Config error: {e}\n")
         sys.exit(1)
 
     if args.mode == "backtest":

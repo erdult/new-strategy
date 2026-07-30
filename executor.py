@@ -238,24 +238,49 @@ class Executor:
             self.logger.error("Post-trade backtest failed: %s", e)
 
     def check_and_exit_positions(self):
-        """Monitor open positions and exit all found positions."""
+        """Check open positions from DB and exit based on per-strategy rules."""
         try:
-            self.rate_limiter.acquire()
-            positions = self.client.get_all_positions()
-            if not positions:
+            open_trades = self.db.get_open_trades()
+            if not open_trades:
                 return
             now = datetime.now(timezone.utc)
-            for p in positions:
-                symbol = p.symbol
-                qty = abs(float(p.qty))
+            for trade in open_trades:
+                symbol = trade["symbol"]
+                strategy = trade["strategy_name"]
+                qty = trade["qty"]
                 if qty <= 0:
                     continue
+                entry_time = datetime.fromisoformat(trade["entry_time_utc"])
+                hold_hours = (now - entry_time).total_seconds() / 3600
+
+                if hold_hours < self.config.risk.min_hold_hours:
+                    continue  # Respect PDT 24h minimum hold
+
+                # Per-strategy exit conditions
+                exit_reason = None
+                if strategy == "pead":
+                    max_hours = self.config.pead.hold_days * 24
+                    if hold_hours >= max_hours:
+                        exit_reason = f"max_hold ({self.config.pead.hold_days}d)"
+                elif strategy == "microcap":
+                    max_hours = self.config.microcap.hold_days * 24
+                    if hold_hours >= max_hours:
+                        exit_reason = f"max_hold ({self.config.microcap.hold_days}d)"
+                elif strategy == "cef":
+                    max_hours = self.config.cef.max_hold_days * 24
+                    if hold_hours >= max_hours:
+                        exit_reason = f"max_hold ({self.config.cef.max_hold_days}d)"
+
+                if not exit_reason:
+                    continue
+
                 price = self.get_current_price(symbol)
                 if not price or price <= 0:
                     continue
-                self.logger.info("EXITING %s qty=%.2f entry=$%.2f curr=$%.2f PnL=%+.2f%%",
-                                symbol, qty, float(p.avg_entry_price), price,
-                                float(p.unrealized_plpc) * 100)
+
+                self.logger.info("EXITING %s %s: %s entry=$%.2f curr=$%.2f hold=%.1fh",
+                                strategy.upper(), symbol, exit_reason,
+                                trade["entry_price"], price, hold_hours)
                 self.rate_limiter.acquire()
                 limit_price = round(price * 0.995, 2)
                 order_req = LimitOrderRequest(
