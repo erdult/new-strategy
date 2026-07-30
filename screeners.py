@@ -76,7 +76,7 @@ def scan_pead_candidates(db: Database, run_dir: str) -> List[Dict[str, Any]]:
 
 def scan_microcap_filings(db: Database, run_dir: str) -> List[Dict[str, Any]]:
     logger = setup_logging("screener_microcap", run_dir)
-    utc_now, local_now = _now_with_tz()
+    utc_now, _ = _now_with_tz()
     signals = []
 
     if not _is_market_hours():
