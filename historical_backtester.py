@@ -20,45 +20,101 @@ class HistoricalBacktester:
         self.db = db
         self.logger = setup_logging("backtester", run_dir)
 
+    def _fetch_prices(self, symbol: str, start: str, end: str, label: str = ""):
+        """Fetch daily prices, checking DB cache before calling yfinance."""
+        cached = self.db.get_cached_price_range(symbol, start, end)
+        if cached is not None and not cached.empty:
+            self.logger.debug("%s: using cached prices (%d rows)", symbol, len(cached))
+            return cached
+        self.logger.debug("%s: fetching prices %s to %s from yfinance%s", symbol, start, end, label)
+        result = yf.download(symbol, start=start, end=end, auto_adjust=True, progress=False)
+        if result is not None and not result.empty:
+            # Flatten MultiIndex columns from yfinance multi-ticker format
+            if isinstance(result.columns, pd.MultiIndex):
+                try:
+                    result = result.xs(symbol, axis=1, level=0)
+                except (KeyError, ValueError):
+                    try:
+                        result = result.xs(symbol, axis=1, level=1)
+                    except (KeyError, ValueError):
+                        pass
+            saved = self.db.save_prices(symbol, result)
+            self.logger.debug("%s: cached %d price rows", symbol, saved)
+        return result
+
     def backtest_pead(self, start_date: str, end_date: str) -> List[Dict[str, Any]]:
         results = []
         self.logger.info("PEAD backtest: %s to %s", start_date, end_date)
 
+        self.logger.info("PEAD: fetching SPY benchmark %s to %s", start_date, end_date)
         try:
-            spy = yf.download("SPY", start=start_date, end=end_date, auto_adjust=True, progress=False)
-            spy_ret = float((1 + spy["Close"].pct_change()).prod().iloc[0] - 1) if not spy.empty else 0
+            spy = self._fetch_prices("SPY", start_date, end_date, " (benchmark)")
+            spy_ret = float((1 + spy["Close"].pct_change()).prod().iloc[0] - 1) if spy is not None and not spy.empty else 0
+            self.logger.info("PEAD: SPY benchmark return = %+.2f%%", spy_ret * 100)
         except Exception as e:
             self.logger.error("SPY fetch failed: %s", e)
             spy_ret = 0
 
-        for symbol in self._get_liquid_tickers():
+        tickers = self._get_liquid_tickers()
+        total = len(tickers)
+        self.logger.info("PEAD: scanning %d liquid tickers for earnings events", total)
+
+        for idx, symbol in enumerate(tickers, 1):
+            self.logger.info("PEAD [%d/%d] %s: checking earnings...", idx, total, symbol)
             try:
-                ticker = yf.Ticker(symbol)
-                earnings = ticker.earnings_dates
+                cached_earnings = self.db.get_cached_earnings(symbol)
+                if cached_earnings is not None:
+                    earnings = cached_earnings
+                    self.logger.info("PEAD [%d/%d] %s: using cached earnings (%d events)", idx, total, symbol, len(earnings))
+                else:
+                    ticker = yf.Ticker(symbol)
+                    earnings = ticker.earnings_dates
+                    if earnings is not None and not earnings.empty:
+                        self.db.save_earnings(symbol, earnings)
+                        self.logger.info("PEAD [%d/%d] %s: fetched & cached %d earnings events", idx, total, symbol, len(earnings))
+                    else:
+                        self.logger.info("PEAD [%d/%d] %s: no earnings data available, skipping", idx, total, symbol)
+                        continue
+
                 if earnings is None or earnings.empty:
+                    self.logger.info("PEAD [%d/%d] %s: no earnings events found", idx, total, symbol)
                     continue
 
-                for idx, row in earnings.iterrows():
+                events_checked = 0
+                events_matched = 0
+                for eidx, row in earnings.iterrows():
                     try:
-                        event_date = pd.to_datetime(idx)
+                        event_date = pd.to_datetime(eidx)
                         if event_date.tzinfo is None:
                             event_date = event_date.tz_localize("UTC")
                         ds = event_date.strftime("%Y-%m-%d")
                         if ds < start_date[:10] or ds > end_date[:10]:
                             continue
+                        events_checked += 1
 
                         eps_est = row.get("epsestimate") or row.get("eps_estimate", 0)
                         eps_act = row.get("epsactual") or row.get("eps_actual", 0)
                         if not (eps_est and eps_act and eps_est > 0):
+                            self.logger.debug("PEAD %s %s: incomplete EPS data est=%s act=%s", symbol, ds, eps_est, eps_act)
                             continue
 
                         surprise = (eps_act - eps_est) / abs(eps_est)
                         if surprise <= self.config.pead.sue_threshold:
+                            self.logger.debug("PEAD %s %s: SUE %+.1f%% <= threshold %.0f%%, skip",
+                                              symbol, ds, surprise * 100, self.config.pead.sue_threshold * 100)
                             continue
 
-                        hist = ticker.history(start=ds, end=(event_date + timedelta(days=45)).strftime("%Y-%m-%d"),
-                                              auto_adjust=True)
-                        if hist.empty or len(hist) < 2:
+                        self.logger.info("PEAD [%d/%d] %s %s: SUE %+.1f%% > threshold %.0f%%, simulating trade...",
+                                         idx, total, symbol, ds, surprise * 100, self.config.pead.sue_threshold * 100)
+                        events_matched += 1
+
+                        hist = self._fetch_prices(
+                            symbol, ds,
+                            (event_date + timedelta(days=45)).strftime("%Y-%m-%d"),
+                            " (trade window)"
+                        )
+                        if hist is None or hist.empty or len(hist) < 2:
+                            self.logger.debug("PEAD %s %s: insufficient price data after earnings", symbol, ds)
                             continue
 
                         entry = float(hist["Open"].iloc[1]) * (1 + self.config.pead.slippage_pct)
@@ -80,12 +136,15 @@ class HistoricalBacktester:
                         results.append(result)
                         self.logger.info("PEAD %s %s PnL %+.2f%% hold %.0fd", symbol, ds, pnl * 100, hold)
                     except Exception as e:
-                        self.logger.warning("PEAD event %s: %s", idx, e)
+                        self.logger.warning("PEAD event %s: %s", eidx, e)
+
+                self.logger.info("PEAD [%d/%d] %s: %d events in range, %d above threshold -> %d trades",
+                                 idx, total, symbol, events_checked, events_matched, sum(1 for r in results if r["symbol"] == symbol))
                 time.sleep(0.5)
             except Exception as e:
                 self.logger.warning("PEAD ticker %s: %s", symbol, e)
 
-        self.logger.info("PEAD backtest: %d trades", len(results))
+        self.logger.info("PEAD backtest complete: %d trades from %d tickers", len(results), total)
         return results
 
     def backtest_microcaps(self, start_date: str, end_date: str) -> List[Dict[str, Any]]:
@@ -94,6 +153,7 @@ class HistoricalBacktester:
 
         try:
             from edgar import get_filings
+            self.logger.info("MICRO: fetching 8-K filings %s to %s", start_date, end_date)
             # filing_date uses colon-separated range string; no limit param, so we break at 200
             filings = get_filings(form="8-K", filing_date=f"{start_date[:10]}:{end_date[:10]}")
         except Exception as e:
@@ -101,9 +161,26 @@ class HistoricalBacktester:
             return results
 
         processed = 0
+        total_filings = 0
         for filing in filings:
+            total_filings += 1
+
+        self.logger.info("MICRO: %d total 8-K filings retrieved, scanning for keywords", total_filings)
+
+        # Re-fetch since we consumed the iterator counting
+        try:
+            from edgar import get_filings
+            filings = get_filings(form="8-K", filing_date=f"{start_date[:10]}:{end_date[:10]}")
+        except Exception as e:
+            self.logger.error("SEC filings re-fetch failed: %s", e)
+            return results
+
+        for fcount, filing in enumerate(filings, 1):
             if processed >= 200:
+                self.logger.info("MICRO: reached processing limit of 200 filings")
                 break
+            if fcount % 25 == 0 or fcount == 1:
+                self.logger.info("MICRO: processing filing %d/%d", fcount, total_filings)
             try:
                 try:
                     entity = filing.get_entity()
@@ -121,15 +198,20 @@ class HistoricalBacktester:
                 if not matched:
                     continue
 
+                self.logger.info("MICRO [%d/%d] %s: matched keywords %s on %s, checking mcap...",
+                                 fcount, total_filings, symbol, matched, fdate)
                 info = yf.Ticker(symbol).info or {}
                 mcap = info.get("marketCap", 0)
                 if not (self.config.microcap.min_market_cap <= mcap <= self.config.microcap.max_market_cap):
+                    self.logger.info("MICRO %s: mcap $%.0f outside range [$%.0f, $%.0f], skip",
+                                     symbol, mcap, self.config.microcap.min_market_cap, self.config.microcap.max_market_cap)
                     continue
 
                 start_f = (pd.to_datetime(fdate) - timedelta(days=5)).strftime("%Y-%m-%d")
                 end_f = (pd.to_datetime(fdate) + timedelta(days=30)).strftime("%Y-%m-%d")
-                hist = yf.Ticker(symbol).history(start=start_f, end=end_f, auto_adjust=True)
-                if hist.empty:
+                hist = self._fetch_prices(symbol, start_f, end_f, " (trade window)")
+                if hist is None or hist.empty:
+                    self.logger.info("MICRO %s: no price data %s to %s, skip", symbol, start_f, end_f)
                     continue
 
                 entry = float(hist["Open"].iloc[0]) * (1 + self.config.microcap.slippage_pct)
@@ -143,8 +225,9 @@ class HistoricalBacktester:
                 # Compute period-matched IWM return for this trade
                 trade_iwm_ret = 0
                 try:
-                    iwm_hist = yf.download("IWM", start=start_f, end=end_f, auto_adjust=True, progress=False)
-                    trade_iwm_ret = float((1 + iwm_hist["Close"].pct_change()).prod().iloc[0] - 1) if not iwm_hist.empty else 0
+                    iwm_hist = self._fetch_prices("IWM", start_f, end_f, " (benchmark)")
+                    if iwm_hist is not None and not iwm_hist.empty:
+                        trade_iwm_ret = float((1 + iwm_hist["Close"].pct_change()).prod().iloc[0] - 1)
                 except Exception:
                     pass
 
@@ -159,12 +242,12 @@ class HistoricalBacktester:
                 }
                 self.db.save_backtest_result(result)
                 results.append(result)
-                self.logger.info("MICRO %s %s PnL %+.2f%% kw=%s", symbol, fdate, pnl * 100, matched)
+                self.logger.info("MICRO %s %s PnL %+.2f%% hold=%.0fd kw=%s", symbol, fdate, pnl * 100, hold, matched)
                 processed += 1
             except Exception as e:
                 self.logger.warning("Micro-cap error: %s", e)
 
-        self.logger.info("Micro-cap backtest: %d trades", len(results))
+        self.logger.info("Micro-cap backtest complete: %d trades from %d filings processed", len(results), total_filings)
         return results
 
     def backtest_cefs(self, start_date: str, end_date: str) -> List[Dict[str, Any]]:
@@ -174,28 +257,39 @@ class HistoricalBacktester:
         cefs = ["BGR", "BST", "CEM", "DSL", "ETV", "EVT", "FFC", "FRA", "GDV", "HQH", "HQL",
                  "HTD", "JPC", "JQC", "MCI", "MMT", "NAD", "NIE", "PDI", "PHK", "PML", "PTY",
                  "QQQX", "RIV", "RVT", "USA", "UTF", "UTG"]
+        total = len(cefs)
+        self.logger.info("CEF: scanning %d tickers for discount opportunities", total)
 
-        for symbol in cefs:
+        for idx, symbol in enumerate(cefs, 1):
+            self.logger.info("CEF [%d/%d] %s: fetching price history...", idx, total, symbol)
             try:
-                hist = yf.Ticker(symbol).history(start=start_date, end=end_date, auto_adjust=True)
-                if hist.empty:
+                hist = self._fetch_prices(symbol, start_date, end_date, " (price history)")
+                if hist is None or hist.empty:
+                    self.logger.info("CEF [%d/%d] %s: no price data available", idx, total, symbol)
                     continue
                 prices = hist["Close"].values
 
                 # Try to fetch actual historical NAV data from yfinance
                 try:
+                    self.logger.debug("CEF %s: attempting NAV data download...", symbol)
                     nav_hist = yf.download(symbol, start=start_date, end=end_date, auto_adjust=False, progress=False)
-                    if not nav_hist.empty and "Nav" in nav_hist.columns:
-                        nav = nav_hist["Nav"].values
-                        self.logger.debug("%s: using yfinance NAV data (%d points)", symbol, len(nav))
+                    if nav_hist is not None and not nav_hist.empty:
+                        if isinstance(nav_hist.columns, pd.MultiIndex):
+                            nav_hist = nav_hist.xs(symbol, axis=1, level=0)
+                        if "Nav" in nav_hist.columns:
+                            nav = nav_hist["Nav"].values
+                            self.logger.info("CEF [%d/%d] %s: using yfinance NAV data (%d points)", idx, total, symbol, len(nav))
+                        else:
+                            raise ValueError("No Nav column")
                     else:
-                        raise ValueError("No Nav column")
+                        raise ValueError("Empty NAV data")
                 except Exception:
                     # Fallback: 50-day SMA as NAV proxy
                     nav = pd.Series(prices).rolling(50, min_periods=20).mean().values
-                    self.logger.debug("%s: using 50-day SMA as NAV proxy", symbol)
+                    self.logger.debug("CEF [%d/%d] %s: NAV unavailable, using 50-day SMA proxy", idx, total, symbol)
 
                 min_window = 50 if isinstance(nav, np.ndarray) and len(nav) == len(prices) else 20
+                trades_found = 0
 
                 for i in range(len(prices)):
                     if i < min_window or np.isnan(nav[i]):
@@ -204,6 +298,7 @@ class HistoricalBacktester:
                     if disc >= self.config.cef.discount_threshold:
                         continue
 
+                    trades_found += 1
                     entry = float(prices[i]) * (1 + self.config.cef.slippage_pct)
                     ed = hist.index[i].strftime("%Y-%m-%d")
                     exit_i = min(i + self.config.cef.max_hold_days, len(prices) - 1)
@@ -236,11 +331,14 @@ class HistoricalBacktester:
                     }
                     self.db.save_backtest_result(result)
                     results.append(result)
-                    self.logger.info("CEF %s %s disc %.1f%%->%.1f%% PnL %+.2f%%", symbol, ed, disc*100, exit_disc*100, pnl*100)
+                    self.logger.info("CEF %s %s disc %.1f%%->%.1f%% PnL %+.2f%% hold=%.0fd", symbol, ed, disc*100, exit_disc*100, pnl*100, hold)
+
+                self.logger.info("CEF [%d/%d] %s: %d discount events found -> %d trades",
+                                 idx, total, symbol, trades_found, sum(1 for r in results if r["symbol"] == symbol))
             except Exception as e:
                 self.logger.warning("CEF error %s: %s", symbol, e)
 
-        self.logger.info("CEF backtest: %d trades", len(results))
+        self.logger.info("CEF backtest complete: %d trades from %d tickers", len(results), total)
         return results
 
     def run_comparison(self, symbol: str, strategy_name: str,
@@ -249,8 +347,8 @@ class HistoricalBacktester:
         end = (pd.to_datetime(event_date) + timedelta(days=int(hold_days) + 5)).strftime("%Y-%m-%d")
         start = (pd.to_datetime(event_date) - timedelta(days=1)).strftime("%Y-%m-%d")
         try:
-            hist = yf.Ticker(symbol).history(start=start, end=end, auto_adjust=True)
-            if hist.empty or len(hist) < 2:
+            hist = self._fetch_prices(symbol, start, end, " (comparison)")
+            if hist is None or hist.empty or len(hist) < 2:
                 return {"expected_pnl": actual_pnl_pct, "discrepancy": 0}
             # Entry: first available open price after event_date
             entry_price = float(hist["Open"].iloc[0])

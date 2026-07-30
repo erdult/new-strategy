@@ -1,8 +1,8 @@
-"""SQLite wrapper for trades, signals, and backtest_results tables."""
+"""SQLite wrapper for trades, signals, backtest_results, and API data cache."""
 
 import sqlite3
 import os
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 
 class Database:
@@ -80,10 +80,32 @@ class Database:
                 notes TEXT,
                 created_at TEXT DEFAULT (datetime('now'))
             );
+            CREATE TABLE IF NOT EXISTS price_cache (
+                symbol TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                volume REAL,
+                source TEXT DEFAULT 'yfinance',
+                cached_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (symbol, trade_date)
+            );
+            CREATE TABLE IF NOT EXISTS earnings_cache (
+                symbol TEXT NOT NULL,
+                event_date TEXT NOT NULL,
+                eps_estimate REAL,
+                eps_actual REAL,
+                cached_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (symbol, event_date)
+            );
             CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy_name);
             CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
             CREATE INDEX IF NOT EXISTS idx_signals_strategy ON signals(strategy_name);
             CREATE INDEX IF NOT EXISTS idx_backtest_strategy ON backtest_results(strategy_name);
+            CREATE INDEX IF NOT EXISTS idx_price_cache_symbol ON price_cache(symbol);
+            CREATE INDEX IF NOT EXISTS idx_earnings_cache_symbol ON earnings_cache(symbol);
         """)
         conn.commit()
 
@@ -178,3 +200,109 @@ class Database:
             rows = self.connect().execute(
                 "SELECT * FROM signals ORDER BY timestamp_utc DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
+
+    # ── API Data Cache ──────────────────────────────────────────
+
+    def get_cached_price_range(self, symbol: str, start_date: str, end_date: str):
+        """Return cached daily prices as DataFrame for symbol within date range, or None."""
+        try:
+            import pandas as pd
+        except ImportError:
+            return None
+        rows = self.connect().execute(
+            "SELECT trade_date, open, high, low, close, volume FROM price_cache "
+            "WHERE symbol = ? AND trade_date >= ? AND trade_date <= ? ORDER BY trade_date",
+            (symbol, start_date[:10], end_date[:10])
+        ).fetchall()
+        if not rows:
+            return None
+        df = pd.DataFrame([dict(r) for r in rows])
+        if df.empty:
+            return None
+        df["trade_date"] = pd.to_datetime(df["trade_date"])
+        df = df.set_index("trade_date")
+        # Rename columns to match yfinance uppercase convention
+        df = df.rename(columns={
+            "open": "Open", "high": "High", "low": "Low",
+            "close": "Close", "volume": "Volume"
+        })
+        return df
+
+    def save_prices(self, symbol: str, df) -> int:
+        """Store OHLCV DataFrame rows into price_cache. Returns count inserted."""
+        if df is None or df.empty:
+            return 0
+        # Flatten MultiIndex columns (yfinance multi-ticker download format)
+        import pandas as pd
+        if isinstance(df.columns, pd.MultiIndex):
+            try:
+                df = df.xs(symbol, axis=1, level=0)
+            except (KeyError, ValueError):
+                try:
+                    df = df.xs(symbol, axis=1, level=1)
+                except (KeyError, ValueError):
+                    return 0
+        conn = self.connect()
+        count = 0
+        for idx, row in df.iterrows():
+            try:
+                def _scalar(v):
+                    if v is None:
+                        return None
+                    return float(v.item()) if hasattr(v, "item") else float(v)
+                conn.execute(
+                    "INSERT OR REPLACE INTO price_cache (symbol, trade_date, open, high, low, close, volume) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (symbol, pd.to_datetime(idx).strftime("%Y-%m-%d"),
+                     _scalar(row.get("Open")), _scalar(row.get("High")),
+                     _scalar(row.get("Low")), _scalar(row.get("Close")),
+                     _scalar(row.get("Volume")))
+                )
+                count += 1
+            except Exception:
+                continue
+        conn.commit()
+        return count
+
+    def get_cached_earnings(self, symbol: str):
+        """Return cached earnings dates as DataFrame for a symbol, or None."""
+        try:
+            import pandas as pd
+        except ImportError:
+            return None
+        rows = self.connect().execute(
+            "SELECT event_date, eps_estimate, eps_actual FROM earnings_cache "
+            "WHERE symbol = ? ORDER BY event_date", (symbol,)
+        ).fetchall()
+        if not rows:
+            return None
+        data = []
+        for r in rows:
+            data.append({"epsestimate": r["eps_estimate"], "epsactual": r["eps_actual"]})
+        df = pd.DataFrame(data, index=pd.to_datetime([r["event_date"] for r in rows]))
+        return df if not df.empty else None
+
+    def save_earnings(self, symbol: str, df) -> int:
+        """Store earnings DataFrame rows into cache. Returns count."""
+        if df is None or df.empty:
+            return 0
+        import pandas as pd
+        conn = self.connect()
+        count = 0
+        for idx, row in df.iterrows():
+            try:
+                event_date = pd.to_datetime(idx).strftime("%Y-%m-%d")
+                eps_est = row.get("epsestimate") or row.get("eps_estimate", 0)
+                eps_act = row.get("epsactual") or row.get("eps_actual", 0)
+                conn.execute(
+                    "INSERT OR REPLACE INTO earnings_cache (symbol, event_date, eps_estimate, eps_actual) "
+                    "VALUES (?, ?, ?, ?)",
+                    (symbol, event_date,
+                     float(eps_est) if eps_est else None,
+                     float(eps_act) if eps_act else None)
+                )
+                count += 1
+            except Exception:
+                continue
+        conn.commit()
+        return count
