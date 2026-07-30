@@ -26,7 +26,7 @@ class HistoricalBacktester:
 
         try:
             spy = yf.download("SPY", start=start_date, end=end_date, auto_adjust=True, progress=False)
-            spy_ret = float((1 + spy["Close"].pct_change()).prod() - 1) if not spy.empty else 0
+            spy_ret = float((1 + spy["Close"].pct_change()).prod().iloc[0] - 1) if not spy.empty else 0
         except Exception as e:
             self.logger.error("SPY fetch failed: %s", e)
             spy_ret = 0
@@ -144,7 +144,7 @@ class HistoricalBacktester:
                 trade_iwm_ret = 0
                 try:
                     iwm_hist = yf.download("IWM", start=start_f, end=end_f, auto_adjust=True, progress=False)
-                    trade_iwm_ret = float((1 + iwm_hist["Close"].pct_change()).prod() - 1) if not iwm_hist.empty else 0
+                    trade_iwm_ret = float((1 + iwm_hist["Close"].pct_change()).prod().iloc[0] - 1) if not iwm_hist.empty else 0
                 except Exception:
                     pass
 
