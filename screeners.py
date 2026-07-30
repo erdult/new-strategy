@@ -27,6 +27,24 @@ def _is_market_hours(exchange_tz: str = "America/New_York") -> bool:
     return 570 <= m <= 960
 
 
+def _check_activist_filing(symbol: str) -> list:
+    """Check for recent 13D/13G activist filings. Best-effort."""
+    results = []
+    try:
+        from edgar import Filing
+        for form in ("13D", "13G"):
+            try:
+                filings = Filing.get_filings(form=form, ticker=symbol, limit=3)
+                for f in filings:
+                    fd = str(getattr(f, "filing_date", "?"))
+                    results.append(f"{form}:{fd}")
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return results
+
+
 def scan_pead_candidates(db: Database, run_dir: str) -> List[Dict[str, Any]]:
     logger = setup_logging("screener_pead", run_dir)
     utc_now = datetime.now(timezone.utc)
@@ -162,8 +180,25 @@ def scan_cef_discounts(db: Database, run_dir: str) -> List[Dict[str, Any]]:
         try:
             info = yf.Ticker(symbol).info or {}
             price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
-            nav = info.get("navPrice") or info.get("yield_")
-            if not price or not nav or nav <= 0:
+            # Try to get NAV from yfinance data
+            nav = None
+            try:
+                nav_df = yf.download(symbol, period="5d", auto_adjust=False, progress=False)
+                if not nav_df.empty and "Nav" in nav_df.columns:
+                    nav = float(nav_df["Nav"].iloc[-1])
+            except Exception:
+                pass
+
+            if nav is None:
+                # Fallback: approximate NAV from price history (50-day SMA)
+                try:
+                    hist_df = yf.download(symbol, period="3mo", auto_adjust=True, progress=False)
+                    if not hist_df.empty:
+                        nav = float(hist_df["Close"].rolling(50, min_periods=20).mean().iloc[-1])
+                except Exception:
+                    pass
+
+            if not price or nav is None or nav <= 0:
                 continue
             discount = (price - nav) / nav
             decision = "buy" if discount < CONFIG.cef.discount_threshold else "skip"
@@ -177,6 +212,10 @@ def scan_cef_discounts(db: Database, run_dir: str) -> List[Dict[str, Any]]:
                 "exchange_time": utc_now.astimezone(ZoneInfo(CONFIG.exchange_timezone)).isoformat(),
                 "executed": 0,
             }
+            if decision == "buy":
+                activist = _check_activist_filing(symbol)
+                if activist:
+                    signal["reason"] += f" | activist: {', '.join(activist)}"
             db.save_signal(signal)
             signals.append(signal)
             logger.info("CEF %s discount=%.1f%% -> %s", symbol, discount * 100, decision)

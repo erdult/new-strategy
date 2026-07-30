@@ -11,6 +11,7 @@ import numpy as np
 from config import CONFIG
 from database import Database
 from logging_utils import setup_logging
+from screeners import _check_activist_filing
 
 
 class HistoricalBacktester:
@@ -92,12 +93,6 @@ class HistoricalBacktester:
         self.logger.info("Micro-cap backtest: %s to %s", start_date, end_date)
 
         try:
-            iwm = yf.download("IWM", start=start_date, end=end_date, auto_adjust=True, progress=False)
-            iwm_ret = float((1 + iwm["Close"].pct_change()).prod() - 1) if not iwm.empty else 0
-        except Exception:
-            iwm_ret = 0
-
-        try:
             from edgar import get_filings
             # filing_date uses colon-separated range string; no limit param, so we break at 200
             filings = get_filings(form="8-K", filing_date=f"{start_date[:10]}:{end_date[:10]}")
@@ -145,12 +140,20 @@ class HistoricalBacktester:
                 hold = max_bars - 1
                 pnl = (exit_p - entry) / entry
 
+                # Compute period-matched IWM return for this trade
+                trade_iwm_ret = 0
+                try:
+                    iwm_hist = yf.download("IWM", start=start_f, end=end_f, auto_adjust=True, progress=False)
+                    trade_iwm_ret = float((1 + iwm_hist["Close"].pct_change()).prod() - 1) if not iwm_hist.empty else 0
+                except Exception:
+                    pass
+
                 result = {
                     "strategy_name": "microcap", "event_date": fdate, "symbol": symbol,
                     "entry_price": round(entry, 4), "exit_price": round(exit_p, 4),
                     "pnl_pct": round(pnl, 6), "pnl_usd": round(pnl * 3000, 2),
-                    "hold_days": float(hold), "spy_return": round(float(iwm_ret), 6),
-                    "alpha": round(pnl - float(iwm_ret), 6),
+                    "hold_days": float(hold), "iwm_return": round(float(trade_iwm_ret), 6),
+                    "alpha": round(pnl - float(trade_iwm_ret), 6),
                     "slippage_pct": self.config.microcap.slippage_pct,
                     "event_type": "8k_catalyst", "notes": f"kw:{','.join(matched)}",
                 }
@@ -204,10 +207,23 @@ class HistoricalBacktester:
                     entry = float(prices[i]) * (1 + self.config.cef.slippage_pct)
                     ed = hist.index[i].strftime("%Y-%m-%d")
                     exit_i = min(i + self.config.cef.max_hold_days, len(prices) - 1)
+                    # Check for early exit on convergence to target discount
+                    for j in range(i + 1, exit_i + 1):
+                        if j >= len(nav) or np.isnan(nav[j]):
+                            break
+                        disc_j = (prices[j] - nav[j]) / nav[j]
+                        if disc_j >= self.config.cef.convergence_target:
+                            exit_i = j
+                            break
                     exit_p = float(prices[exit_i])
                     hold = exit_i - i
                     exit_disc = float((prices[exit_i] - nav[exit_i]) / nav[exit_i]) if exit_i < len(nav) and not np.isnan(nav[exit_i]) else disc
                     pnl = (exit_p - entry) / entry
+
+                    activist = _check_activist_filing(symbol)
+                    notes = f"entry_disc={disc*100:.1f}% exit_disc={exit_disc*100:.1f}%"
+                    if activist:
+                        notes += f" | activist: {','.join(activist)}"
 
                     result = {
                         "strategy_name": "cef", "event_date": ed, "symbol": symbol,
@@ -216,7 +232,7 @@ class HistoricalBacktester:
                         "hold_days": float(hold), "spy_return": 0, "alpha": 0,
                         "slippage_pct": self.config.cef.slippage_pct,
                         "event_type": "discount_arb",
-                        "notes": f"entry_disc={disc*100:.1f}% exit_disc={exit_disc*100:.1f}%",
+                        "notes": notes,
                     }
                     self.db.save_backtest_result(result)
                     results.append(result)

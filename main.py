@@ -51,7 +51,7 @@ def mode_backtest(args):
             all_results.extend(r)
             metrics = bt.generate_performance_metrics(strat)
             if metrics:
-                _print_metrics(strat, metrics)
+                _print_metrics(strat, metrics, logger)
 
         if all_results:
             total_pnl = sum(r.get("pnl_usd", 0) for r in all_results)
@@ -83,6 +83,7 @@ def mode_live(args):
                       timezone=CONFIG.exchange_timezone, id="cef")
     scheduler.add_job(executor.cancel_unfilled_orders, trigger="interval", minutes=15, id="cleanup")
     scheduler.add_job(executor.check_closed_positions, trigger="interval", minutes=30, id="check_closed")
+    scheduler.add_job(executor.check_and_exit_positions, trigger="interval", minutes=5, id="check_positions")
 
     scheduler.start()
     logger.info("Scheduler started: %s", [j.id for j in scheduler.get_jobs()])
@@ -120,7 +121,7 @@ def _run_screener(name, scan_func, db, run_dir, executor, logger):
                 slip = CONFIG.pead.slippage_pct if name == "pead" else \
                        CONFIG.microcap.slippage_pct if name == "microcap" else \
                        CONFIG.cef.slippage_pct
-                price = executor._get_current_price(sig["symbol"])
+                price = executor.get_current_price(sig["symbol"])
                 if price and price > 0:
                     qty = max(1, int(CONFIG.risk.max_position_size_usd * 0.2 / price))
                 else:
@@ -131,16 +132,18 @@ def _run_screener(name, scan_func, db, run_dir, executor, logger):
         logger.error("%s screener failed: %s", name, e, exc_info=True)
 
 
-def _print_metrics(strategy, metrics):
+def _print_metrics(strategy, metrics, logger):
     try:
         from tabulate import tabulate
-        print(f"\n{'='*50}\n  {strategy.upper()} METRICS\n{'='*50}")
-        print(tabulate([[k, v] for k, v in metrics.items()], headers=["Metric", "Value"], tablefmt="simple"))
+        logger.info("=" * 50)
+        logger.info("  %s METRICS", strategy.upper())
+        logger.info("=" * 50)
+        for row in tabulate([[k, v] for k, v in metrics.items()], headers=["Metric", "Value"], tablefmt="simple").split('\n'):
+            logger.info(row)
     except ImportError:
-        print(f"\n--- {strategy.upper()} METRICS ---")
+        logger.info("--- %s METRICS ---", strategy.upper())
         for k, v in metrics.items():
-            print(f"  {k}: {v}")
-        print()
+            logger.info("  %s: %s", k, v)
 
 
 def main():

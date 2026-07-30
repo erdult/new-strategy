@@ -42,7 +42,7 @@ class Executor:
         except Exception as e:
             return f"unknown ({e})"
 
-    def _get_current_price(self, symbol: str) -> Optional[float]:
+    def get_current_price(self, symbol: str) -> Optional[float]:
         try:
             self.rate_limiter.acquire()
             asset = self.client.get_latest_trade(symbol)
@@ -111,7 +111,7 @@ class Executor:
             self.logger.info("%s %s skipped: kill-switch", ts_log, symbol)
             return None
 
-        price = self._get_current_price(symbol)
+        price = self.get_current_price(symbol)
         if price is None:
             return None
 
@@ -236,3 +236,34 @@ class Executor:
                                  (pnl_pct - comp.get("expected_pnl", 0)) * 100)
         except Exception as e:
             self.logger.error("Post-trade backtest failed: %s", e)
+
+    def check_and_exit_positions(self):
+        """Monitor open positions and exit all found positions."""
+        try:
+            self.rate_limiter.acquire()
+            positions = self.client.get_all_positions()
+            if not positions:
+                return
+            now = datetime.now(timezone.utc)
+            for p in positions:
+                symbol = p.symbol
+                qty = abs(float(p.qty))
+                if qty <= 0:
+                    continue
+                price = self.get_current_price(symbol)
+                if not price or price <= 0:
+                    continue
+                self.logger.info("EXITING %s qty=%.2f entry=$%.2f curr=$%.2f PnL=%+.2f%%",
+                                symbol, qty, float(p.avg_entry_price), price,
+                                float(p.unrealized_plpc) * 100)
+                self.rate_limiter.acquire()
+                limit_price = round(price * 0.995, 2)
+                order_req = LimitOrderRequest(
+                    symbol=symbol, qty=qty,
+                    side=OrderSide.SELL,
+                    limit_price=limit_price,
+                    time_in_force=TimeInForce.DAY,
+                )
+                self.client.submit_order(order_req)
+        except Exception as e:
+            self.logger.error("Position exit check failed: %s", e, exc_info=True)
