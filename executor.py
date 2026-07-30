@@ -1,9 +1,9 @@
 """Alpaca paper execution — limit orders, PDT cooldown, post-trade backtest hook."""
 
 import os
-import time
 import threading
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
+from datetime import timedelta
 from typing import Optional, Dict, Any, List
 from zoneinfo import ZoneInfo
 
@@ -76,8 +76,8 @@ class Executor:
                 return False
             return True
         except Exception as e:
-            self.logger.error("Daily loss check failed: %s", e)
-            return True
+            self.logger.critical("KILL-SWITCH: daily loss API call failed: %s", e)
+            return False
 
     def _check_cooldown(self, symbol: str) -> bool:
         with self._lock:
@@ -88,6 +88,11 @@ class Executor:
                     return False
                 del self._cooldowns[symbol]
             return True
+
+    def record_cooldown(self, symbol: str) -> None:
+        with self._lock:
+            self._cooldowns[symbol] = datetime.now(timezone.utc) + timedelta(hours=self.config.risk.min_hold_hours)
+        self.logger.info("Cooldown set for %s: %.1f hours", symbol, self.config.risk.min_hold_hours)
 
     @retry_with_backoff(max_retries=2, base_delay=1.0)
     def place_limit_order(
@@ -118,6 +123,7 @@ class Executor:
             self.logger.warning("%s position $%.2f > max $%.2f, reducing qty",
                                 symbol, notional, self.config.risk.max_position_size_usd)
             qty = self.config.risk.max_position_size_usd / price
+            notional = qty * price
 
         if not self.check_buying_power(notional):
             return None
@@ -146,6 +152,7 @@ class Executor:
             }
             trade_id = self.db.save_trade(trade_data)
             self.logger.info("Trade #%d saved for %s", trade_id, symbol)
+            self.record_cooldown(symbol)
             return trade_id
 
         except Exception as e:
