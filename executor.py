@@ -186,6 +186,41 @@ class Executor:
         except Exception as e:
             self.logger.error("cancel_unfilled failed: %s", e)
 
+    def check_closed_positions(self):
+        """Poll Alpaca for closed positions and run post-trade backtest for any closed trades."""
+        try:
+            current_positions = self.get_positions()
+            current_symbols = {p["symbol"] for p in current_positions}
+            open_trades = self.db.get_open_trades()
+
+            for trade in open_trades:
+                symbol = trade["symbol"]
+                if symbol not in current_symbols:
+                    self.logger.info("CLOSED: %s no longer in Alpaca positions, running post-trade backtest", symbol)
+                    try:
+                        trade_id = trade["id"]
+                        entry_price = trade.get("entry_price", 0)
+                        strategy_name = trade.get("strategy_name", "unknown")
+                        exit_price = trade.get("exit_price", 0)
+                        pnl_pct = trade.get("pnl_pct", 0)
+                        hold_minutes = trade.get("hold_minutes", 0)
+                        hold_days = hold_minutes / (60 * 24) if hold_minutes else 1.0
+                        entry_time_utc = trade.get("entry_time_utc", "")
+
+                        self.run_post_trade_backtest(
+                            symbol=symbol, strategy_name=strategy_name,
+                            entry_price=entry_price, exit_price=exit_price,
+                            pnl_pct=pnl_pct, hold_days=hold_days,
+                            entry_time_utc=entry_time_utc
+                        )
+
+                        self.db.update_trade(trade_id, {"status": "closed"})
+                        self.logger.info("Trade #%d %s marked as closed", trade_id, symbol)
+                    except Exception as e:
+                        self.logger.error("Failed to process closed trade %s: %s", symbol, e)
+        except Exception as e:
+            self.logger.error("check_closed_positions failed: %s", e)
+
     def run_post_trade_backtest(self, symbol: str, strategy_name: str,
                                  entry_price: float, exit_price: float,
                                  pnl_pct: float, hold_days: float, entry_time_utc: str):

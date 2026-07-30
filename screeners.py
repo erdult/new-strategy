@@ -33,6 +33,11 @@ def scan_pead_candidates(db: Database, run_dir: str) -> List[Dict[str, Any]]:
     signals = []
     logger.info("PEAD scan starting %s", format_with_tz(utc_now))
 
+    # Check if yf.EarningsCalendar is available
+    if not hasattr(yf, "EarningsCalendar"):
+        logger.warning("yf.EarningsCalendar not available in this yfinance version")
+        return signals
+
     try:
         earnings = yf.EarningsCalendar(from_date=utc_now).data
         if earnings is None or earnings.empty:
@@ -53,6 +58,14 @@ def scan_pead_candidates(db: Database, run_dir: str) -> List[Dict[str, Any]]:
                 continue
             surprise = (eps_act - eps_est) / abs(eps_est)
             decision = "buy" if surprise > CONFIG.pead.sue_threshold else "skip"
+
+            # Deduplication: skip if a buy signal already exists today for this symbol + strategy
+            if decision == "buy":
+                today_str = utc_now.strftime("%Y-%m-%d")
+                existing = db.get_signals_by_symbol_strategy_date(symbol, "pead", today_str)
+                if existing:
+                    logger.info("PEAD %s SUE %+.1f%% SKIP (already signaled today)", symbol, surprise * 100)
+                    continue
             signal = {
                 "symbol": symbol, "strategy_name": "pead",
                 "raw_data": str(row.to_dict()),
@@ -141,7 +154,9 @@ def scan_cef_discounts(db: Database, run_dir: str) -> List[Dict[str, Any]]:
 
     logger.info("CEF scan %s", format_with_tz(utc_now))
 
-    cef_tickers = ["GOVT", "TLT", "HYG", "CWB", "PCY", "EMB", "BKLN", "FLOT", "JPST", "NEAR", "PULS", "GSY"]
+    cef_tickers = ["BGR", "BST", "CEM", "DSL", "ETV", "EVT", "FFC", "FRA", "GDV", "HQH", "HQL",
+                    "HTD", "JPC", "JQC", "MCI", "MMT", "NAD", "NIE", "PDI", "PHK", "PML", "PTY",
+                    "QQQX", "RIV", "RVT", "USA", "UTF", "UTG"]
 
     for symbol in cef_tickers:
         try:

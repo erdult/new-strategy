@@ -29,14 +29,6 @@ class RateLimiter:
                 time.sleep(sleep_for)
             continue
 
-    def __call__(self, func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            self.acquire()
-            return func(*args, **kwargs)
-        return wrapper
-
-
 def retry_with_backoff(max_retries: int = 3, base_delay: float = 1.0):
     def decorator(func):
         @wraps(func)

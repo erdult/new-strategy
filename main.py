@@ -82,6 +82,7 @@ def mode_live(args):
                       trigger="cron", day_of_week="mon-fri", hour=8, minute=30,
                       timezone=CONFIG.exchange_timezone, id="cef")
     scheduler.add_job(executor.cancel_unfilled_orders, trigger="interval", minutes=15, id="cleanup")
+    scheduler.add_job(executor.check_closed_positions, trigger="interval", minutes=30, id="check_closed")
 
     scheduler.start()
     logger.info("Scheduler started: %s", [j.id for j in scheduler.get_jobs()])
@@ -119,7 +120,12 @@ def _run_screener(name, scan_func, db, run_dir, executor, logger):
                 slip = CONFIG.pead.slippage_pct if name == "pead" else \
                        CONFIG.microcap.slippage_pct if name == "microcap" else \
                        CONFIG.cef.slippage_pct
-                executor.place_limit_order(symbol=sig["symbol"], qty=1, side="buy",
+                price = executor._get_current_price(sig["symbol"])
+                if price and price > 0:
+                    qty = max(1, int(CONFIG.risk.max_position_size_usd * 0.2 / price))
+                else:
+                    qty = 1
+                executor.place_limit_order(symbol=sig["symbol"], qty=qty, side="buy",
                                            strategy_name=name, slippage_pct=slip)
     except Exception as e:
         logger.error("%s screener failed: %s", name, e, exc_info=True)

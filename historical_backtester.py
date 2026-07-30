@@ -25,7 +25,7 @@ class HistoricalBacktester:
 
         try:
             spy = yf.download("SPY", start=start_date, end=end_date, auto_adjust=True, progress=False)
-            spy_ret = float(spy["Close"].pct_change().sum()) if not spy.empty else 0
+            spy_ret = float((1 + spy["Close"].pct_change()).prod() - 1) if not spy.empty else 0
         except Exception as e:
             self.logger.error("SPY fetch failed: %s", e)
             spy_ret = 0
@@ -93,7 +93,7 @@ class HistoricalBacktester:
 
         try:
             iwm = yf.download("IWM", start=start_date, end=end_date, auto_adjust=True, progress=False)
-            iwm_ret = float(iwm["Close"].pct_change().sum()) if not iwm.empty else 0
+            iwm_ret = float((1 + iwm["Close"].pct_change()).prod() - 1) if not iwm.empty else 0
         except Exception:
             iwm_ret = 0
 
@@ -168,7 +168,9 @@ class HistoricalBacktester:
         results = []
         self.logger.info("CEF backtest: %s to %s", start_date, end_date)
 
-        cefs = ["GOVT", "TLT", "HYG", "CWB", "PCY", "EMB", "BKLN", "FLOT", "JPST", "NEAR"]
+        cefs = ["BGR", "BST", "CEM", "DSL", "ETV", "EVT", "FFC", "FRA", "GDV", "HQH", "HQL",
+                 "HTD", "JPC", "JQC", "MCI", "MMT", "NAD", "NIE", "PDI", "PHK", "PML", "PTY",
+                 "QQQX", "RIV", "RVT", "USA", "UTF", "UTG"]
 
         for symbol in cefs:
             try:
@@ -176,10 +178,24 @@ class HistoricalBacktester:
                 if hist.empty:
                     continue
                 prices = hist["Close"].values
-                nav = pd.Series(prices).rolling(20, min_periods=5).mean().values
+
+                # Try to fetch actual historical NAV data from yfinance
+                try:
+                    nav_hist = yf.download(symbol, start=start_date, end=end_date, auto_adjust=False, progress=False)
+                    if not nav_hist.empty and "Nav" in nav_hist.columns:
+                        nav = nav_hist["Nav"].values
+                        self.logger.debug("%s: using yfinance NAV data (%d points)", symbol, len(nav))
+                    else:
+                        raise ValueError("No Nav column")
+                except Exception:
+                    # Fallback: 50-day SMA as NAV proxy
+                    nav = pd.Series(prices).rolling(50, min_periods=20).mean().values
+                    self.logger.debug("%s: using 50-day SMA as NAV proxy", symbol)
+
+                min_window = 50 if isinstance(nav, np.ndarray) and len(nav) == len(prices) else 20
 
                 for i in range(len(prices)):
-                    if i < 20 or np.isnan(nav[i]):
+                    if i < min_window or np.isnan(nav[i]):
                         continue
                     disc = (prices[i] - nav[i]) / nav[i]
                     if disc >= self.config.cef.discount_threshold:
@@ -214,18 +230,23 @@ class HistoricalBacktester:
     def run_comparison(self, symbol: str, strategy_name: str,
                         actual_entry: float, actual_exit: float,
                         actual_pnl_pct: float, hold_days: float, event_date: str) -> Dict[str, Any]:
-        end = (pd.to_datetime(event_date) + timedelta(days=90)).strftime("%Y-%m-%d")
-        start = (pd.to_datetime(event_date) - timedelta(days=10)).strftime("%Y-%m-%d")
+        end = (pd.to_datetime(event_date) + timedelta(days=int(hold_days) + 5)).strftime("%Y-%m-%d")
+        start = (pd.to_datetime(event_date) - timedelta(days=1)).strftime("%Y-%m-%d")
         try:
             hist = yf.Ticker(symbol).history(start=start, end=end, auto_adjust=True)
-            if hist.empty:
+            if hist.empty or len(hist) < 2:
                 return {"expected_pnl": actual_pnl_pct, "discrepancy": 0}
-            exp = float(hist["Close"].pct_change(21).iloc[-1]) if len(hist) >= 22 else actual_pnl_pct
-            if np.isnan(exp):
-                exp = actual_pnl_pct
-            disc = actual_pnl_pct - exp
+            # Entry: first available open price after event_date
+            entry_price = float(hist["Open"].iloc[0])
+            # Exit: close at index matching hold_days (or last available)
+            exit_idx = min(int(hold_days), len(hist) - 1)
+            exit_price = float(hist["Close"].iloc[exit_idx])
+            exp_pnl = (exit_price - entry_price) / entry_price
+            if np.isnan(exp_pnl):
+                exp_pnl = actual_pnl_pct
+            disc = actual_pnl_pct - exp_pnl
             return {"symbol": symbol, "strategy": strategy_name, "event_date": event_date,
-                    "expected_pnl": round(float(exp), 6), "actual_pnl_pct": round(actual_pnl_pct, 6),
+                    "expected_pnl": round(float(exp_pnl), 6), "actual_pnl_pct": round(actual_pnl_pct, 6),
                     "discrepancy": round(float(disc), 6), "hold_days": hold_days}
         except Exception as e:
             self.logger.error("Comparison failed %s: %s", symbol, e)

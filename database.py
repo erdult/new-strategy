@@ -104,6 +104,13 @@ class Database:
         return cur.lastrowid
 
     def update_trade(self, trade_id: int, updates: Dict[str, Any]) -> None:
+        ALLOWED_COLS = {"symbol", "strategy_name", "entry_price", "exit_price", "qty",
+                        "target_price", "stop_loss", "pnl_pct", "pnl_usd", "status",
+                        "exit_time_utc", "exit_time_exchange", "exit_reason",
+                        "hold_minutes", "slippage_applied"}
+        invalid = set(updates) - ALLOWED_COLS
+        if invalid:
+            raise ValueError(f"Invalid columns for update: {invalid}")
         cols = ", ".join(f"{k} = ?" for k in updates)
         vals = list(updates.values()) + [trade_id]
         conn = self.connect()
@@ -154,6 +161,12 @@ class Database:
         else:
             rows = self.connect().execute(
                 "SELECT * FROM backtest_results ORDER BY event_date").fetchall()
+        return [dict(r) for r in rows]
+
+    def get_signals_by_symbol_strategy_date(self, symbol: str, strategy_name: str, date: str) -> List[Dict[str, Any]]:
+        rows = self.connect().execute(
+            "SELECT * FROM signals WHERE symbol = ? AND strategy_name = ? AND timestamp_utc LIKE ? AND decision = 'buy'",
+            (symbol, strategy_name, f"{date}%")).fetchall()
         return [dict(r) for r in rows]
 
     def get_signals(self, strategy_name: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
